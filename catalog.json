@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "org.nodivu.ducking",
+      "version": "1.0.0",
+      "title": "Ducking",
+      "author": "Nodivu contributors",
+      "publisher_id": "nodivu",
+      "description": "Abaixa a música enquanto o sinal de referência está ativo.",
+      "archive": "org.nodivu.ducking/1.0.0/plugin.zip",
+      "download_bytes": 98860,
+      "readme": "org.nodivu.ducking/1.0.0/README.md",
+      "platform": "win32-x64",
+      "host_api": 2,
+      "resource_tier": "light",
+      "repository": "https://github.com/Warier/nodivu-ducking",
+      "logo": "org.nodivu.ducking/1.0.0/logo.png",
+      "images": {
+        "logo.png": "org.nodivu.ducking/1.0.0/logo.png"
+      }
+    },
+    {
+      "id": "org.nodivu.talk-button",
+      "version": "1.0.0",
+      "title": "Botão de fala",
+      "author": "Nodivu contributors",
+      "publisher_id": "nodivu",
+      "description": "Sempre aberto, segurar para falar ou alternar o microfone.",
+      "archive": "org.nodivu.talk-button/1.0.0/plugin.zip",
+      "download_bytes": 87836,
+      "readme": "org.nodivu.talk-button/1.0.0/README.md",
+      "platform": "win32-x64",
+      "host_api": 2,
+      "resource_tier": "light",
+      "repository": "https://github.com/Warier/nodivu-talk-button",
+      "logo": "org.nodivu.talk-button/1.0.0/logo.png",
+      "images": {
+        "logo.png": "org.nodivu.talk-button/1.0.0/logo.png"
+      }
+    }
+  ]
+}
