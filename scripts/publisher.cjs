@@ -2,6 +2,7 @@
 const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto'),{execFileSync}=require('node:child_process');
 const {Metadata,Root,Key,Signature,Targets,TargetFile,MetaFile,Snapshot,Timestamp}=require('@tufjs/models');
 const roles=['root','targets','snapshot','timestamp'];
+const publishingRoles = ['targets', 'snapshot', 'timestamp'];
 const hashes=b=>({sha256:crypto.createHash('sha256').update(b).digest('hex')});
 const expires=days=>new Date(Date.now()+days*86400000).toISOString();
 function pair(){const k=crypto.generateKeyPairSync('ed25519');const pub=k.publicKey.export({format:'der',type:'spki'}).subarray(-32).toString('hex');return {id:hashes(pub).sha256,public:pub,private:k.privateKey.export({format:'pem',type:'pkcs8'})};}
@@ -22,9 +23,86 @@ function dpapi(bytes,decode=false){
  return Buffer.from(execFileSync('powershell.exe',['-NoProfile','-NonInteractive','-Command',script],{input:Buffer.from(bytes).toString('base64'),encoding:'utf8',windowsHide:true}).trim(),'base64');
 }
 function atomic(file,data){fs.mkdirSync(path.dirname(file),{recursive:true});fs.writeFileSync(file+'.tmp',data,{flag:'wx'});fs.renameSync(file+'.tmp',file);}
+// Routine publishing must work even when the recovery bundle has been taken offline.
+function provisionSigners(directory, allKeys) {
+ const publishing = Object.fromEntries(publishingRoles.map(role => [role, allKeys[role]]));
+ atomic(path.join(directory, 'publish.dpapi'), dpapi(Buffer.from(JSON.stringify(publishing))));
+ atomic(path.join(directory, 'timestamp.dpapi'), dpapi(Buffer.from(JSON.stringify(allKeys.timestamp))));
+}
+function requireRoleKeys(rootMetadata, roleKeys, names) {
+ for (const role of names) {
+  if (!rootMetadata.signed.roles[role].keyIDs.includes(roleKeys[role]?.id))
+   throw Error('Signing credentials do not match the active root for ' + role);
+ }
+}
+function timestampSigner(rootMetadata, pem) {
+ if (!pem) throw Error('Missing timestamp private key');
+ const publicKey = crypto.createPublicKey(crypto.createPrivateKey(pem));
+ if (publicKey.asymmetricKeyType !== 'ed25519') throw Error('Expected an Ed25519 timestamp key');
+ const publicHex = publicKey.export({format:'der', type:'spki'}).subarray(-32).toString('hex');
+ const id = rootMetadata.signed.roles.timestamp.keyIDs.find(id => rootMetadata.signed.keys[id]?.keyVal.public === publicHex);
+ if (!id || ['root','snapshot','targets'].some(role =>
+  rootMetadata.signed.roles[role].keyIDs.some(other => rootMetadata.signed.keys[other]?.keyVal.public === publicHex)))
+  throw Error('The Actions credential must belong exclusively to the active timestamp role');
+ return {id, private:pem};
+}
+function trustedRoot(repo) {
+ const folder = path.join(repo,'public','metadata');
+ const parse = data => Metadata.fromJSON('root',JSON.parse(data));
+ let trusted = parse(JSON.parse(fs.readFileSync(path.join(repo,'source.json'))).root);
+ trusted.verifyDelegate('root',trusted);
+ const head = parse(fs.readFileSync(path.join(folder,'root.json')));
+ while (trusted.signed.version < head.signed.version) {
+  const version = trusted.signed.version + 1;
+  const next = parse(fs.readFileSync(path.join(folder,version+'.root.json')));
+  if (next.signed.version !== version) throw Error('Nonconsecutive root rotation');
+  trusted.verifyDelegate('root',next);
+  next.verifyDelegate('root',next);
+  trusted = next;
+ }
+ if (!trusted.signed.equals(head.signed)) throw Error('Published root differs from trusted root chain');
+ trusted.verifyDelegate('root',head);
+ return trusted;
+}
+function renewTimestamp(rootMetadata, previousBytes, snapshotBytes, targetsBytes, signer, now = new Date()) {
+ const previous = Metadata.fromJSON('timestamp', JSON.parse(previousBytes));
+ const snapshot = Metadata.fromJSON('snapshot', JSON.parse(snapshotBytes));
+ const targets = Metadata.fromJSON('targets', JSON.parse(targetsBytes));
+ for (const [role, record] of Object.entries({timestamp: previous, snapshot, targets}))
+  rootMetadata.verifyDelegate(role, record);
+ const targetsRef = snapshot.signed.meta['targets.json'];
+ for (const [ref, bytes] of [[previous.signed.snapshotMeta,snapshotBytes],[targetsRef,targetsBytes]]) {
+  if (!Number.isSafeInteger(ref?.length) || ref.length < 1 || !/^[a-f0-9]{64}$/i.test(ref.hashes?.sha256 ?? ''))
+   throw Error('Signed metadata is missing its size or SHA-256');
+  ref.verify(bytes);
+ }
+ if (previous.signed.snapshotMeta.version !== snapshot.signed.version || targetsRef.version !== targets.signed.version)
+  throw Error('Catalog metadata versions disagree');
+ const deadline = Math.min(now.getTime() + 14 * 86400000,
+  ...[rootMetadata, snapshot, targets].map(m => Date.parse(m.signed.expires)));
+ if (!Number.isFinite(deadline) || deadline <= now.getTime() + 7 * 86400000)
+  throw Error('Root, snapshot or targets need operator renewal before extending timestamp');
+ requireRoleKeys(rootMetadata, {timestamp: signer}, ['timestamp']);
+ if (Date.parse(previous.signed.expires) > now.getTime() + 7 * 86400000) return null;
+ const next = signed(new Timestamp({version: previous.signed.version + 1,
+  expires: new Date(deadline).toISOString(), snapshotMeta: previous.signed.snapshotMeta}), signer);
+ rootMetadata.verifyDelegate('timestamp', Metadata.fromJSON('timestamp', JSON.parse(next)));
+ return next;
+}
 function walk(folder,prefix=''){let out=[];for(const e of fs.readdirSync(folder,{withFileTypes:true})){if(e.isSymbolicLink())throw Error('Symlink prohibited');const name=prefix+e.name;if(e.isDirectory())out.push(...walk(path.join(folder,e.name),name+'/'));else if(e.isFile())out.push([name,fs.readFileSync(path.join(folder,e.name))]);else throw Error('Special file');}return out;}
 function main(){
- const [command,arg]=process.argv.slice(2),repo=path.resolve(__dirname,'..'),site=path.join(repo,'public'),meta=path.join(site,'metadata');
+ const [command,arg,ghExecutable]=process.argv.slice(2),repo=path.resolve(__dirname,'..'),site=path.join(repo,'public'),meta=path.join(site,'metadata');
+ function renew(currentRoot,signer) {
+  const read = role => fs.readFileSync(path.join(meta,role+'.json'));
+  const next = renewTimestamp(currentRoot,read('timestamp'),read('snapshot'),read('targets'),signer);
+  if(next) atomic(path.join(meta,'timestamp.json'),next);
+  console.log(next ? 'Renewed timestamp until '+JSON.parse(next).signed.expires : 'Timestamp is still fresh.');
+ }
+ if (command==='renew-actions') {
+  const currentRoot = trustedRoot(repo);
+  renew(currentRoot,timestampSigner(currentRoot,process.env.STORE_TIMESTAMP_KEY));
+  return;
+ }
  if(command==='add'){
   const project=path.resolve(arg),pkg=path.join(project,'dist/package');
   const m=JSON.parse(fs.readFileSync(path.join(pkg,'nodivu-package.json'))),a=JSON.parse(fs.readFileSync(path.join(pkg,'plugin.json')));
@@ -37,28 +115,52 @@ function main(){
   if(fs.existsSync(path.join(pkg,'logo.png'))){fs.copyFileSync(path.join(pkg,'logo.png'),path.join(target,'logo.png'));row.logo=prefix+'/logo.png';row.images={'logo.png':row.logo};}
   const file=path.join(repo,'catalog.json'),c=fs.existsSync(file)?JSON.parse(fs.readFileSync(file)):{schema_version:1,plugins:[]};c.plugins=c.plugins.filter(p=>p.id!==row.id);c.plugins.push(row);atomic(file,JSON.stringify(c,null,2)+'\n');console.log('Staged '+row.id+' '+row.version);return;
  }
- if(!['init','publish','rotate'].includes(command)||!arg)throw Error('Usage: publisher.cjs add PROJECT | init/publish/rotate PRIVATE_DIRECTORY');
+ if(!['init','provision-signers','configure-actions','publish','renew','rotate'].includes(command)||!arg)throw Error('Usage: publisher.cjs add PROJECT | init/provision-signers/configure-actions/publish/renew/rotate PRIVATE_DIRECTORY | renew-actions');
  const privateDir=path.resolve(arg);if(privateDir===repo||privateDir.startsWith(repo+path.sep))throw Error('Keys must be OUTSIDE this repository.');
  const keyfile=path.join(privateDir,'keys.dpapi');let k;
  fs.mkdirSync(meta,{recursive:true});
  if(command==='init'){
   if(fs.existsSync(keyfile)||fs.existsSync(path.join(meta,'root.json')))throw Error('Already initialized');
   k=keys();fs.mkdirSync(privateDir,{recursive:true});atomic(keyfile,dpapi(Buffer.from(JSON.stringify(k))));
+  provisionSigners(privateDir,k);
   const data=root(k);atomic(path.join(meta,'1.root.json'),data);atomic(path.join(meta,'root.json'),data);
   atomic(path.join(repo,'source.json'),JSON.stringify({schema_version:1,metadata_url:'https://warier.github.io/nodivu-plugins/metadata/',target_url:'https://warier.github.io/nodivu-plugins/targets/',root:data.toString(),official_publishers:['nodivu']},null,2)+'\n');
   console.log('Initialized public root; private keys protected with DPAPI.');return;
  }
- k=JSON.parse(dpapi(fs.readFileSync(keyfile),true));
+ const readRole = filename => JSON.parse(dpapi(fs.readFileSync(path.join(privateDir, filename)), true));
+ const currentRoot = trustedRoot(repo);
+ if(command==='configure-actions') {
+  const signer=timestampSigner(currentRoot,readRole('timestamp.dpapi').private);
+  // gh encrypts the secret for this repository. Keep it off disk, argv and logs.
+  execFileSync(ghExecutable || 'gh',['secret','set','STORE_TIMESTAMP_KEY','--repo','Warier/nodivu-plugins'],
+   {input:signer.private,stdio:['pipe','ignore','inherit'],windowsHide:true});
+  console.log('Configured the timestamp-only Actions secret for Warier/nodivu-plugins.');
+  return;
+ }
+ if(command==='provision-signers') {
+  const recovery = readRole('keys.dpapi');
+  requireRoleKeys(currentRoot,recovery,roles);
+  provisionSigners(privateDir,recovery);
+  console.log('Provisioned separate DPAPI credentials for routine publishing and timestamp-only renewal.');
+  return;
+ }
+ if(command==='renew') {
+  renew(currentRoot,timestampSigner(currentRoot,readRole('timestamp.dpapi').private));
+  return;
+ }
+ k=readRole(command==='rotate'?'keys.dpapi':'publish.dpapi');
+ requireRoleKeys(currentRoot,k,command==='rotate'?roles:publishingRoles);
  if(command==='rotate'){
   const previous=JSON.parse(fs.readFileSync(path.join(meta,'root.json'))),next=keys(),data=root(next,previous.signed.version+1,k);
   const before=Metadata.fromJSON('root',previous),after=Metadata.fromJSON('root',JSON.parse(data));before.verifyDelegate('root',after);after.verifyDelegate('root',after);
   // Archive encrypted old material before switching. Never delete old versioned roots.
   fs.copyFileSync(keyfile,path.join(privateDir,'keys-root-'+previous.signed.version+'.dpapi'),fs.constants.COPYFILE_EXCL);
   atomic(keyfile,dpapi(Buffer.from(JSON.stringify(next))));atomic(path.join(meta,(previous.signed.version+1)+'.root.json'),data);atomic(path.join(meta,'root.json'),data);
+  provisionSigners(privateDir,next);
   k=next; // source.json deliberately keeps the original bootstrap for existing clients.
  }
  const publicRoot=Metadata.fromJSON('root',JSON.parse(fs.readFileSync(path.join(meta,'root.json'))));
- for(const role of roles)if(!publicRoot.signed.roles[role].keyIDs.includes(k[role].id))throw Error('Local keys do not match published root.');
+ requireRoleKeys(publicRoot,k,publishingRoles);
  const index=fs.readFileSync(path.join(repo,'catalog.json'));atomic(path.join(site,'targets/catalog.json'),index);
  const existing=path.join(meta,'timestamp.json'),version=fs.existsSync(existing)?JSON.parse(fs.readFileSync(existing)).signed.version+1:1;
  const output=metadata(k,walk(path.join(site,'targets')),version);
@@ -69,4 +171,4 @@ function main(){
  console.log('Signed catalog revision '+version+'; renew before '+JSON.parse(output['timestamp.json']).signed.expires);
 }
 if(require.main===module){try{main();}catch(e){console.error(e.message);process.exitCode=1;}}
-module.exports={keys,root,metadata,hashes};
+module.exports={keys,root,metadata,hashes,renewTimestamp,timestampSigner,trustedRoot};

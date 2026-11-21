@@ -36,17 +36,27 @@ O selo oficial vem do publicador curado `nodivu`, não de uma declaração do au
 
 Quatro chaves Ed25519 distintas (root/targets/snapshot/timestamp), limiar **1 por papel**.
 Custódia inicial: mantenedor Warier, assinatura manual local. Esse modelo de teste tem um
-único responsável e não oferece quorum entre pessoas. Nenhuma chave está no GitHub Actions,
-no app, em ZIPs ou neste repo. DPAPI CurrentUser protege as chaves em repouso, vinculado ao
-usuário/máquina Windows que as gerou. Comprometimento dessa conta ainda pode permitir assinar.
+único responsável. Apenas a chave de timestamp fica também no secret `STORE_TIMESTAMP_KEY`
+do Actions. O publicador Windows usa `publish.dpapi` para targets, snapshot e timestamp.
+O bundle de recuperação `keys.dpapi` contém a raiz e só é lido ao provisionar credenciais ou
+rotacionar chaves. DPAPI CurrentUser vincula o material local ao usuário/máquina Windows.
 
 Validade: root 365 dias, targets 90 dias, snapshot 30 dias, timestamp **14 dias**.
-Execute `publish` e publique o commit **antes de 14 dias**, mesmo sem plugins novos.
-Sem renovação, o cliente permite consultar o cache, mas recusa instalar/atualizar.
-Não há renovação automática nesta fase. Antes de uso amplo, estabelecer responsáveis,
-backup portátil offline e renovação monitorada. Copiar apenas keys.dpapi para outro PC
-não garante recuperação; preserve também a recuperação do perfil Windows. Não exporte
-chaves em texto para o Git. Não há serviço comercial nem assinatura Authenticode aqui.
+O Actions verifica diariamente se restam até sete dias de timestamp. Ele valida a cadeia
+existente, assina a nova data para o mesmo snapshot e publica no Pages. Se um dos papéis
+superiores tiver sete dias ou menos, a automação pede renovação ao mantenedor.
+Execute `publish` localmente antes desse ponto (por exemplo, a cada três semanas) e
+publique os metadados. Renove também a raiz antes de vencer. O monitor consulta o endereço
+público diariamente e acusa falha com até cinco dias restantes. Confira as notificações
+dos workflows no GitHub. Se a loja vencer, o cache pode ser consultado.
+
+Para uma instalação antiga, execute `node scripts/publisher.cjs provision-signers CAMINHO_PRIVADO`
+uma vez. Após provisionar ou rotacionar, execute `node scripts/publisher.cjs configure-actions CAMINHO_PRIVADO`
+com `gh` autenticado em Warier/nodivu-plugins. Esse comando deriva a identidade pública da
+credencial, confirma que pertence exclusivamente a timestamp e entrega apenas essa chave
+ao GitHub CLI pela entrada padrão. `init` já cria os arquivos separados.
+Guarde a recuperação e o backup offline sob controle do mantenedor. Copiar um arquivo
+DPAPI para outro PC por si só não garante recuperação.
 
 ### Rotação / recuperação
 

@@ -1,0 +1,54 @@
+name: Renew store timestamp
+on:
+  schedule:
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+
+permissions: {}
+concurrency:
+  group: store-timestamp
+  cancel-in-progress: false
+jobs:
+  renew:
+    if: github.ref == 'refs/heads/main' && github.repository == 'Warier/nodivu-plugins'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.publish.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: node scripts/verify-public.cjs
+      - name: Renew timestamp for the authenticated snapshot
+        env:
+          STORE_TIMESTAMP_KEY: ${{ secrets.STORE_TIMESTAMP_KEY }}
+        run: node scripts/publisher.cjs renew-actions
+      - id: publish
+        name: Publish only the renewed timestamp
+        run: |
+          if git diff --quiet -- public/metadata/timestamp.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          node scripts/verify-public.cjs
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- public/metadata/timestamp.json
+          git commit -m 'chore(store): renew timestamp of signed snapshot'
+          git push origin HEAD:main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+  deploy:
+    needs: renew
+    if: needs.renew.outputs.changed == 'true'
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/pages.yml

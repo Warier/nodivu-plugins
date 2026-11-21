@@ -1,0 +1,30 @@
+name: Monitor public catalog
+on:
+  schedule:
+    - cron: '27 11 * * *'
+  workflow_dispatch:
+  workflow_run:
+    workflows: ['Publish signed catalog']
+    branches: [main]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  public-catalog:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Test monitor
+        run: node --test tests/monitor-catalog.test.cjs
+      - name: Verify deployed metadata and downloadable packages
+        run: node scripts/monitor-catalog.cjs
